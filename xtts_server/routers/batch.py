@@ -37,7 +37,7 @@ from dispatcher import WorkerHandle
 from job_store import JobStore
 from logging_config import get_logger
 from queue_manager import QueueFullError
-from routers.tts import _resolve_speaker  # reuse speaker resolution logic
+from routers.tts import SpeakerEmbedding, SpeakerName, _resolve_speaker
 from worker import SynthesisRequest, SynthesisResult
 
 logger = get_logger(__name__)
@@ -55,10 +55,17 @@ MAX_BATCH_SIZE = 50
 class BatchItem(BaseModel):
     text: str = Field(..., description="Text to synthesise for this item.")
     language: str | None = Field(default=None)
-    speaker_name: str | None = Field(default=None)
-    gpt_cond_latent: list[list[list[float]]] | None = Field(default=None)
-    speaker_embedding: list[list[float]] | None = Field(default=None)
+    speaker: Annotated[SpeakerName | SpeakerEmbedding, Field(discriminator="type")]
     format: AudioFormat = Field(default="wav")
+    temperature: float = Field(default=0.75)
+    length_penalty: float = Field(default=1.0)
+    repetition_penalty: float = Field(default=10.0)
+    top_k: int = Field(default=50)
+    top_p: float = Field(default=0.85)
+    do_sample: bool = Field(default=True)
+    num_beams: int = Field(default=1)
+    speed: float = Field(default=1.0)
+    enable_text_splitting: bool = Field(default=False)
 
 
 class BatchRequest(BaseModel):
@@ -166,6 +173,15 @@ async def submit_batch(body: BatchRequest, request: Request) -> BatchResponse:
             gpt_cond_latent=gpt_lat,
             speaker_embedding=spk_emb,
             result_queue=result_queue,
+            temperature=item.temperature,
+            length_penalty=item.length_penalty,
+            repetition_penalty=item.repetition_penalty,
+            top_k=item.top_k,
+            top_p=item.top_p,
+            do_sample=item.do_sample,
+            num_beams=item.num_beams,
+            speed=item.speed,
+            enable_text_splitting=item.enable_text_splitting,
         )
 
         fmt = item.format
@@ -176,11 +192,12 @@ async def submit_batch(body: BatchRequest, request: Request) -> BatchResponse:
         async def on_complete(
             worker: WorkerHandle,
             result: SynthesisResult,
+            elapsed_ms: float,
             _job_id: str = job.job_id,
             _fmt: str = fmt,
             _outputs_dir: str = outputs_dir,
         ) -> None:
-            await job_store.mark_running(_job_id, worker.worker_id, worker.gpu_index)
+            await job_store.mark_running(_job_id, worker.worker_id, worker.gpu_index, elapsed_ms)
             if result.error:
                 await job_store.mark_failed(_job_id, result.error)
                 return

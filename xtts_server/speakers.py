@@ -92,7 +92,8 @@ class SpeakerStore:
             speaker_embedding=speaker_embedding,
             created_at=created_at,
         )
-        self._cache[name] = record
+        with self._cache_lock:
+            self._cache[name] = record
 
         logger.info(
             "Speaker registered | name=%s | dir=%s | "

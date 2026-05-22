@@ -148,14 +148,17 @@ class JobStore:
         )
         return job
 
-    async def mark_running(self, job_id: str, worker_id: str, gpu_index: int) -> None:
+    async def mark_running(self, job_id: str, worker_id: str, gpu_index: int, elapsed_ms: float = 0.0) -> None:
         async with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 logger.warning("mark_running — job not found: %s", job_id)
                 return
             job.status = JobStatus.RUNNING
-            job.started_at = time.monotonic()
+            # Back-calculate started_at so synthesis_ms() reflects actual synthesis
+            # duration. elapsed_ms is the time the worker spent on synthesis,
+            # measured by _collect_result before on_complete is called.
+            job.started_at = time.monotonic() - elapsed_ms / 1000
             job.worker_id = worker_id
             job.gpu_index = gpu_index
         logger.info(

@@ -57,6 +57,12 @@ class Settings(BaseSettings):
     MAX_TEXT_LENGTH: int = 5000
     SAMPLE_RATE: int = 24000
 
+    # Inference precision
+    USE_FP16: bool = False  # cast model to float16 on GPU for faster inference
+
+    # Worker result timeout
+    WORKER_TIMEOUT_SECONDS: int = 300  # max seconds to wait for a worker result before giving up
+
     # Logging
     LOG_LEVEL: str = "INFO"
 

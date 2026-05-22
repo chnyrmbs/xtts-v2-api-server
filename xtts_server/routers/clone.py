@@ -172,6 +172,18 @@ async def clone_speaker(
         )
 
         # ---- Persist speaker to store --------------------------------
+        # Re-check existence after the awaited latent computation — a
+        # concurrent clone for the same name could have succeeded while we
+        # were computing latents (there are no more await points between
+        # this check and register(), so this closes the TOCTOU window).
+        if state.speaker_store.exists(speaker_name):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Speaker '{speaker_name}' already exists. "
+                    "Delete it first with DELETE /v1/speakers/{name}."
+                ),
+            )
         # register() calls shutil.copy2(tmp_path → wav_dest).  We only
         # delete tmp_path after this completes successfully so a partial
         # copy cannot leave the speaker in a corrupt state.

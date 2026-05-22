@@ -32,8 +32,17 @@ class SynthesisRequest:
     text: str
     language: str
     gpt_cond_latent: np.ndarray  # float32, CPU numpy — shape (1, T, 1024)
-    speaker_embedding: np.ndarray  # float32, CPU numpy — shape (1, 512)
+    speaker_embedding: np.ndarray  # float32, CPU numpy — shape (1, 512, 1)
     result_queue: object = field(repr=False)  # Queue[SynthesisResult]
+    temperature: float = 0.75
+    length_penalty: float = 1.0
+    repetition_penalty: float = 10.0
+    top_k: int = 50
+    top_p: float = 0.85
+    do_sample: bool = True
+    num_beams: int = 1
+    speed: float = 1.0
+    enable_text_splitting: bool = False
 
 
 @dataclass
@@ -44,6 +53,15 @@ class StreamSynthesisRequest:
     gpt_cond_latent: np.ndarray
     speaker_embedding: np.ndarray
     result_queue: object = field(repr=False)  # Queue[SynthesisChunk | SynthesisStreamEnd]
+    temperature: float = 0.75
+    length_penalty: float = 1.0
+    repetition_penalty: float = 10.0
+    top_k: int = 50
+    top_p: float = 0.85
+    do_sample: bool = True
+    num_beams: int = 1
+    speed: float = 1.0
+    enable_text_splitting: bool = False
 
 
 @dataclass
@@ -91,6 +109,7 @@ def worker_main(
     gpu_index: int,
     model_path: str,
     request_queue: Queue,
+    use_fp16: bool = False,
 ) -> None:
     from logging_config import get_logger
 
@@ -143,6 +162,10 @@ def worker_main(
     model.load_checkpoint(config, checkpoint_dir=model_path, eval=True)
     model.to(device)
 
+    fp16 = use_fp16 and device.startswith("cuda")
+    if fp16:
+        logger.info("Worker %s — fp16 autocast enabled", worker_id)
+
     elapsed = time.monotonic() - t0
     logger.info("Worker %s — model loaded in %.2f s", worker_id, elapsed)
 
@@ -165,12 +188,12 @@ def worker_main(
             break
 
         if isinstance(request, SynthesisRequest):
-            ms = _handle_synthesis(request, model, device, gpu_index, worker_id, logger)
+            ms = _handle_synthesis(request, model, device, gpu_index, worker_id, logger, fp16)
             total_requests += 1
             total_synthesis_ms += ms
 
         elif isinstance(request, StreamSynthesisRequest):
-            ms = _handle_stream(request, model, device, gpu_index, worker_id, logger)
+            ms = _handle_stream(request, model, device, gpu_index, worker_id, logger, fp16)
             total_requests += 1
             total_synthesis_ms += ms
 
@@ -207,6 +230,7 @@ def _handle_synthesis(
     gpu_index: int,
     worker_id: str,
     logger,
+    fp16: bool = False,
 ) -> float:
     elapsed_ms = 0.0  # guard: ensure always defined even if put() raises
     text_preview = request.text[:60].replace("\n", " ")
@@ -218,17 +242,29 @@ def _handle_synthesis(
         text_preview,
     )
 
+    import torch
+
     t0 = time.monotonic()
     try:
         gpt_cond_latent = _to_tensor(request.gpt_cond_latent, device)
         speaker_embedding = _to_tensor(request.speaker_embedding, device)
 
-        outputs = model.inference(
-            request.text,
-            request.language,
-            gpt_cond_latent,
-            speaker_embedding,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=fp16):
+            outputs = model.inference(
+                request.text,
+                request.language,
+                gpt_cond_latent,
+                speaker_embedding,
+                temperature=request.temperature,
+                length_penalty=request.length_penalty,
+                repetition_penalty=request.repetition_penalty,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                do_sample=request.do_sample,
+                num_beams=request.num_beams,
+                speed=request.speed,
+                enable_text_splitting=request.enable_text_splitting,
+            )
         audio = np.array(outputs["wav"], dtype=np.float32)
 
         elapsed_ms = (time.monotonic() - t0) * 1000
@@ -243,8 +279,6 @@ def _handle_synthesis(
             audio_s,
             rtf,
         )
-
-        import torch
 
         if device.startswith("cuda"):
             vram_mb = torch.cuda.memory_allocated(gpu_index) / (1024**2)
@@ -274,6 +308,7 @@ def _handle_stream(
     gpu_index: int,
     worker_id: str,
     logger,
+    fp16: bool = False,
 ) -> float:
     elapsed_ms = 0.0  # guard: ensure always defined even if put() raises
     text_preview = request.text[:60].replace("\n", " ")
@@ -285,6 +320,8 @@ def _handle_stream(
         text_preview,
     )
 
+    import torch
+
     t0 = time.monotonic()
     elapsed_ms = 0.0
     chunk_count = 0
@@ -293,15 +330,25 @@ def _handle_stream(
         gpt_cond_latent = _to_tensor(request.gpt_cond_latent, device)
         speaker_embedding = _to_tensor(request.speaker_embedding, device)
 
-        for chunk in model.inference_stream(
-            request.text,
-            request.language,
-            gpt_cond_latent,
-            speaker_embedding,
-        ):
-            chunk_np = np.array(chunk, dtype=np.float32)
-            request.result_queue.put(SynthesisChunk(job_id=request.job_id, chunk=chunk_np))
-            chunk_count += 1
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=fp16):
+            for chunk in model.inference_stream(
+                request.text,
+                request.language,
+                gpt_cond_latent,
+                speaker_embedding,
+                temperature=request.temperature,
+                length_penalty=request.length_penalty,
+                repetition_penalty=request.repetition_penalty,
+                top_k=request.top_k,
+                top_p=request.top_p,
+                do_sample=request.do_sample,
+                num_beams=request.num_beams,
+                speed=request.speed,
+                enable_text_splitting=request.enable_text_splitting,
+            ):
+                chunk_np = np.array(chunk, dtype=np.float32)
+                request.result_queue.put(SynthesisChunk(job_id=request.job_id, chunk=chunk_np))
+                chunk_count += 1
 
         elapsed_ms = (time.monotonic() - t0) * 1000
         logger.info(

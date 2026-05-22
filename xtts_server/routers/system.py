@@ -48,6 +48,11 @@ class GpuInfo(BaseModel):
     utilisation_pct: float
 
 
+class ActiveJobInfo(BaseModel):
+    job_id: str
+    elapsed_s: float
+
+
 class WorkerInfo(BaseModel):
     worker_id: str
     gpu_index: int
@@ -55,6 +60,7 @@ class WorkerInfo(BaseModel):
     total_requests: int
     avg_synthesis_ms: float
     alive: bool
+    active_jobs: list[ActiveJobInfo]
 
 
 class QueueInfo(BaseModel):

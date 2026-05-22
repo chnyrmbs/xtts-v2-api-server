@@ -8,9 +8,11 @@ Protocol
        {
          "text": "...",
          "language": "tr",          // optional, defaults to DEFAULT_LANGUAGE
-         "speaker_name": "alice",   // or supply raw embeddings below
-         "gpt_cond_latent": [...],  // optional, alternative to speaker_name
-         "speaker_embedding": [...] // optional, alternative to speaker_name
+         "speaker": {
+           "type": "SpeakerName",       // or "SpeakerEmbedding" for raw arrays
+           "name": "alice"              // only for type "SpeakerName"
+           // for type "SpeakerEmbedding": "gpt_cond_latent": [[...]], "speaker_embedding": [...]
+         }
        }
   3. Server responds with binary frames — raw float32 PCM at 24 000 Hz (mono).
      Each frame is one synthesis chunk as produced by model.inference_stream().
@@ -36,19 +38,22 @@ Backpressure
 
 import asyncio
 import contextlib
+import functools
 import json
 import multiprocessing
+import queue
 import time
 import uuid
+from typing import Annotated
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 import numpy as np
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from config import SUPPORTED_LANGUAGES
 from logging_config import get_logger
 from queue_manager import QueueFullError
-from routers.tts import _resolve_speaker
+from routers.tts import SpeakerEmbedding, SpeakerName, _resolve_speaker
 from worker import StreamSynthesisRequest, SynthesisChunk, SynthesisStreamEnd
 
 logger = get_logger(__name__)
@@ -64,9 +69,16 @@ router = APIRouter(tags=["stream"])
 class StreamRequest(BaseModel):
     text: str
     language: str | None = None
-    speaker_name: str | None = None
-    gpt_cond_latent: list[list[list[float]]] | None = None
-    speaker_embedding: list[list[float]] | None = None
+    speaker: Annotated[SpeakerName | SpeakerEmbedding, Field(discriminator="type")]
+    temperature: float = 0.75
+    length_penalty: float = 1.0
+    repetition_penalty: float = 10.0
+    top_k: int = 50
+    top_p: float = 0.85
+    do_sample: bool = True
+    num_beams: int = 1
+    speed: float = 1.0
+    enable_text_splitting: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +154,15 @@ async def stream_tts(websocket: WebSocket) -> None:
             gpt_cond_latent=gpt_cond_latent,
             speaker_embedding=speaker_embedding,
             result_queue=result_queue,
+            temperature=params.temperature,
+            length_penalty=params.length_penalty,
+            repetition_penalty=params.repetition_penalty,
+            top_k=params.top_k,
+            top_p=params.top_p,
+            do_sample=params.do_sample,
+            num_beams=params.num_beams,
+            speed=params.speed,
+            enable_text_splitting=params.enable_text_splitting,
         )
 
         try:
@@ -164,6 +185,7 @@ async def stream_tts(websocket: WebSocket) -> None:
         total_bytes = 0
         first_chunk_ms: float | None = None
         t_stream_start = time.monotonic()
+        worker_timeout = settings.WORKER_TIMEOUT_SECONDS
 
         try:
             # try/finally ensures the worker slot is always released, even
@@ -171,7 +193,23 @@ async def stream_tts(websocket: WebSocket) -> None:
             while True:
                 # Run the blocking queue.get() in a thread-pool executor so the
                 # event loop remains free to handle other connections.
-                item = await loop.run_in_executor(None, result_queue.get)
+                try:
+                    item = await loop.run_in_executor(
+                        None, functools.partial(result_queue.get, timeout=worker_timeout)
+                    )
+                except queue.Empty:
+                    logger.error(
+                        "Stream timed out | job_id=%s | worker=%s | timeout=%ds",
+                        job_id,
+                        worker.worker_id,
+                        worker_timeout,
+                    )
+                    await _close_error(
+                        websocket,
+                        job_id,
+                        f"Worker did not respond within {worker_timeout}s — it may have crashed.",
+                    )
+                    break
 
                 if isinstance(item, SynthesisChunk):
                     raw = item.chunk.astype(np.float32).tobytes()

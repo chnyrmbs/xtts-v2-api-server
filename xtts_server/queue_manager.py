@@ -31,6 +31,8 @@ import asyncio
 from collections.abc import Awaitable, Callable
 import contextlib
 from dataclasses import dataclass, field
+import functools
+import queue
 import time
 from typing import Any
 
@@ -55,7 +57,7 @@ class _QueuedItem:
     request: Any  # SynthesisRequest | StreamSynthesisRequest
     enqueued_at: float = field(default_factory=time.monotonic)
     # on_complete is None for streaming jobs; the WS handler owns the result.
-    on_complete: Callable[[WorkerHandle, SynthesisResult], Awaitable[None]] | None = None
+    on_complete: Callable[[WorkerHandle, SynthesisResult, float], Awaitable[None]] | None = None
     # Resolved by the drain loop once dispatched; lets the WS handler learn
     # which worker was assigned so it can call dispatcher.release() correctly.
     worker_future: asyncio.Future | None = None
@@ -67,9 +69,10 @@ class _QueuedItem:
 
 
 class QueueManager:
-    def __init__(self, dispatcher: Dispatcher, max_queue_size: int) -> None:
+    def __init__(self, dispatcher: Dispatcher, max_queue_size: int, worker_timeout_seconds: int = 300) -> None:
         self._dispatcher = dispatcher
         self._max_size = max_queue_size
+        self._worker_timeout = worker_timeout_seconds
         # asyncio.Queue with a hard size cap — put_nowait raises QueueFull when full.
         self._queue: asyncio.Queue[_QueuedItem] = asyncio.Queue(maxsize=max_queue_size)
         self._drain_task: asyncio.Task | None = None
@@ -98,7 +101,7 @@ class QueueManager:
     async def submit_job(
         self,
         request: SynthesisRequest,
-        on_complete: Callable[[WorkerHandle, SynthesisResult], Awaitable[None]],
+        on_complete: Callable[[WorkerHandle, SynthesisResult, float], Awaitable[None]],
     ) -> None:
         """
         Enqueue an async job request.
@@ -203,7 +206,7 @@ class QueueManager:
         self,
         worker: WorkerHandle,
         request: SynthesisRequest,
-        on_complete: Callable[[WorkerHandle, SynthesisResult], Awaitable[None]],
+        on_complete: Callable[[WorkerHandle, SynthesisResult, float], Awaitable[None]],
         enqueued_at: float,
     ) -> None:
         """
@@ -214,17 +217,31 @@ class QueueManager:
         t0 = time.monotonic()
 
         try:
-            result: SynthesisResult = await loop.run_in_executor(None, request.result_queue.get)
+            result: SynthesisResult = await loop.run_in_executor(
+                None, functools.partial(request.result_queue.get, timeout=self._worker_timeout)
+            )
             elapsed_ms = (time.monotonic() - t0) * 1000
+        except queue.Empty:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            logger.error(
+                "Worker timed out | job=%s | worker=%s | timeout=%ds",
+                request.job_id,
+                worker.worker_id,
+                self._worker_timeout,
+            )
+            result = SynthesisResult(
+                job_id=request.job_id,
+                audio=None,
+                error=f"Worker did not respond within {self._worker_timeout}s — it may have crashed.",
+            )
         except Exception as exc:
-            # Should not normally happen, but guard defensively.
+            elapsed_ms = (time.monotonic() - t0) * 1000
             logger.error(
                 "Result collection error | job=%s | worker=%s | %s",
                 request.job_id,
                 worker.worker_id,
                 exc,
             )
-            elapsed_ms = (time.monotonic() - t0) * 1000
             result = SynthesisResult(job_id=request.job_id, audio=None, error=str(exc))
 
         # Release the worker slot so the drain loop can dispatch the next request.
@@ -233,7 +250,7 @@ class QueueManager:
         )
 
         # Notify the job store (or whatever the caller registered).
-        await on_complete(worker, result)
+        await on_complete(worker, result, elapsed_ms)
 
         # Total lifecycle: from the moment the request entered the asyncio queue
         # until on_complete finishes (includes queue wait + synthesis + audio save).

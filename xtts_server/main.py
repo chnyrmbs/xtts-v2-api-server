@@ -108,6 +108,8 @@ async def lifespan(app: FastAPI):
     dispatcher = Dispatcher(
         model_path=settings.MODEL_PATH,
         workers_per_gpu_list=settings.workers_per_gpu_list,
+        use_fp16=settings.USE_FP16,
+        worker_timeout_seconds=settings.WORKER_TIMEOUT_SECONDS,
     )
     dispatcher.start()
     app.state.dispatcher = dispatcher
@@ -125,6 +127,7 @@ async def lifespan(app: FastAPI):
     queue_manager = QueueManager(
         dispatcher=dispatcher,
         max_queue_size=settings.MAX_QUEUE_SIZE,
+        worker_timeout_seconds=settings.WORKER_TIMEOUT_SECONDS,
     )
     app.state.queue_manager = queue_manager
 
@@ -198,6 +201,7 @@ def create_app() -> FastAPI:
     # ---- Routers -----------------------------------------------------
     app.include_router(system.router)
     app.include_router(tts.router)
+    app.include_router(tts.audio_router)
     app.include_router(clone.router)
     app.include_router(batch.router)
     app.include_router(jobs.router)
@@ -215,8 +219,6 @@ app = create_app()
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import os
-
     import uvicorn
 
     # Re-read settings just for the uvicorn bind config.
@@ -224,7 +226,6 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", "8000"))
     log_level = os.environ.get("LOG_LEVEL", "info").lower()
-    workers = int(os.environ.get("UVICORN_WORKERS", "1"))
 
     # Use workers=1 — horizontal scaling is handled by our own worker pool,
     # not by uvicorn's multi-process mode (which would spawn multiple model

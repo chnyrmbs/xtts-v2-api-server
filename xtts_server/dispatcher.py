@@ -25,8 +25,10 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 from dataclasses import dataclass, field
+import functools
 import multiprocessing
 import multiprocessing.managers
+import queue
 import time
 
 from logging_config import get_logger
@@ -69,9 +71,17 @@ class WorkerHandle:
 
 
 class Dispatcher:
-    def __init__(self, model_path: str, workers_per_gpu_list: list[int]) -> None:
+    def __init__(
+        self,
+        model_path: str,
+        workers_per_gpu_list: list[int],
+        use_fp16: bool = False,
+        worker_timeout_seconds: int = 300,
+    ) -> None:
         self._model_path = model_path
         self._workers_per_gpu = workers_per_gpu_list
+        self._use_fp16 = use_fp16
+        self._worker_timeout = worker_timeout_seconds
         self._workers: list[WorkerHandle] = []
         # Single Condition for all active_requests mutations.  Its internal
         # lock is held by dispatch(), release(), and wait_for_free_worker().
@@ -128,7 +138,7 @@ class Dispatcher:
                 q = _MP_CTX.Queue()
                 p = _MP_CTX.Process(
                     target=worker_main,
-                    args=(worker_id, gpu_index, self._model_path, q),
+                    args=(worker_id, gpu_index, self._model_path, q, self._use_fp16),
                     name=f"xtts-{worker_id}",
                     daemon=True,
                 )
@@ -273,7 +283,20 @@ class Dispatcher:
         worker = await self.dispatch(request)
 
         try:
-            result: LatentsResult = await loop.run_in_executor(None, result_queue.get)
+            result: LatentsResult = await loop.run_in_executor(
+                None, functools.partial(result_queue.get, timeout=self._worker_timeout)
+            )
+        except queue.Empty:
+            logger.error(
+                "compute_latents timed out | job=%s | worker=%s | timeout=%ds",
+                job_id,
+                worker.worker_id,
+                self._worker_timeout,
+            )
+            result = LatentsResult(
+                job_id=job_id,
+                error=f"Worker did not respond within {self._worker_timeout}s — it may have crashed.",
+            )
         finally:
             await self.release(worker.worker_id, elapsed_ms=0.0, job_id=job_id)
 
