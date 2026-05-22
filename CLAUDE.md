@@ -56,11 +56,12 @@ cd xtts_server && python main.py
 | `GET` | `/health` | Liveness probe — returns `{"status":"ok","uptime_s":…}` |
 | `GET` | `/v1/system/info` | GPU/worker stats, queue depth, job counts |
 | `POST` | `/v1/tts` | Submit async TTS job → `202 {job_id, poll_url}` |
-| `POST` | `/v1/tts/sync` | Synthesise and return audio file immediately (client blocks) |
 | `GET` | `/v1/tts/{job_id}/audio` | Download finished audio (`409` if not done yet) |
 | `GET` | `/v1/jobs` | List all jobs (debug) |
 | `GET` | `/v1/jobs/{job_id}` | Poll job status + timing metadata |
 | `POST` | `/v1/batch` | Submit up to 50 TTS items in one request |
+| `POST` | `/audio/speech-file` | Synthesise and return raw WAV bytes immediately (client blocks) |
+| `POST` | `/audio/speech` | Synthesise and return JSON `TtsResponse` with base64 audio (client blocks) |
 | `POST` | `/v1/clone` | Upload reference audio → register speaker name |
 | `GET` | `/v1/speakers` | List all registered speakers |
 | `GET` | `/v1/speakers/{name}` | Metadata for one speaker |
@@ -75,6 +76,7 @@ cd xtts_server && python main.py
 POST /v1/tts
   → TtsRequest validated (Pydantic)
   → _resolve_speaker() → (gpt_cond_latent: np.ndarray, speaker_embedding: np.ndarray, speaker_id: str)
+    (discriminates on body.speaker.type: "SpeakerName" → store lookup, "SpeakerEmbedding" → reshape + use inline)
   → job_store.create() → Job (PENDING)
   → dispatcher.make_queue() → Manager proxy Queue  ← NOT a bare mp.Queue
   → SynthesisRequest(job_id, text, lang, latents, result_queue)
@@ -133,7 +135,7 @@ Job state is a plain `dict[str, Job]` guarded by `asyncio.Lock`. TTL cleanup run
 The event loop must never block. Five places where this matters:
 - `result_queue.get()` — in `queue_manager._collect_result` and `ws/stream.py`
 - `save_audio()` (soundfile write) — in the `on_complete` callback in `tts.py` and `batch.py`
-- `audio_to_bytes()` (soundfile encode) — in `synthesise_sync` in `tts.py` (sync endpoint must not block either)
+- `audio_to_bytes()` (soundfile encode) — in `_run_synthesis` in `tts.py` (sync endpoints must not block either)
 - `process.join()` — in `dispatcher.shutdown`
 - `worker.request_queue.put(request)` — in `dispatcher.dispatch()`
 
@@ -163,6 +165,30 @@ This guarantees the slot is freed even if the client disconnects mid-stream or a
 
 `release()` also increments `WorkerHandle.total_requests` (fixing the long-standing bug where it always showed 0).
 
+### 16. Speaker specification — discriminated union
+`TtsRequest`, `BatchItem`, and `StreamRequest` all carry a `speaker` field typed as a Pydantic v2 discriminated union:
+
+```python
+speaker: Annotated[SpeakerName | SpeakerEmbedding, Field(discriminator="type")]
+```
+
+- **`SpeakerName`** (`type: "SpeakerName"`): `name` — looked up in `SpeakerStore`. Returns latents already in correct numpy shape from disk.
+- **`SpeakerEmbedding`** (`type: "SpeakerEmbedding"`): `gpt_cond_latent` (2-D, shape T×1024) + `speaker_embedding` (1-D, 512 floats). `_resolve_speaker` reshapes them to `(1, T, 1024)` and `(1, 512, 1)` before passing to the worker. Sending the full 3-D shapes in JSON is verbose and error-prone; reshaping at the boundary keeps the API ergonomic.
+
+`SpeakerName` and `SpeakerEmbedding` are defined in `routers/tts.py` and imported by `batch.py` and `ws/stream.py`. `_resolve_speaker` is the single resolution point — all three callers go through it.
+
+### 17. FP16 inference — `torch.autocast` not `model.half()`
+`USE_FP16=true` enables mixed-precision inference on GPU. The implementation uses `torch.autocast` rather than `model.half()`:
+
+```python
+with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=fp16):
+    outputs = model.inference(...)
+```
+
+`model.half()` permanently casts all weights to float16, which breaks XTTS-v2's VITS decoder and some normalisation layers on GPU. `torch.autocast` lets PyTorch decide per-operation whether float16 is numerically safe, falling back to float32 where needed. On CPU `fp16` is always `False` (`fp16 = use_fp16 and device.startswith("cuda")`), so autocast is a no-op.
+
+`torch` must be imported at the top of `_handle_synthesis` and `_handle_stream` (before the `with torch.autocast` call) — these functions use lazy imports and `torch` is not available at module level in the worker process.
+
 ### 13. GPU memory fraction (`GPU_MEMORY_FRACTION`)
 Workers read `os.environ.get("GPU_MEMORY_FRACTION", "1.0")` and call `torch.cuda.set_per_process_memory_fraction(fraction, gpu_index)` **before** the model is loaded. This caps how much VRAM each worker process can allocate. `start-server.sh` validates and exports this value; `worker.py` applies it in `_apply_memory_fraction()` called at device setup time.
 
@@ -183,9 +209,12 @@ Registered in `create_app()` via `@app.middleware("http")`. Logs one line per re
 
 1. Client connects, sends one JSON text frame:
    ```json
-   {"text": "...", "language": "tr", "speaker_name": "alice"}
+   {"text": "...", "language": "tr", "speaker": {"type": "SpeakerName", "name": "alice"}}
    ```
-   (or `gpt_cond_latent` + `speaker_embedding` arrays instead of `speaker_name`)
+   Or with raw conditioning arrays:
+   ```json
+   {"text": "...", "speaker": {"type": "SpeakerEmbedding", "gpt_cond_latent": [[...]], "speaker_embedding": [...]}}
+   ```
 2. Server replies with **binary frames** — raw `float32` little-endian PCM, 24 000 Hz mono. Each frame is one chunk from `model.inference_stream()`.
 3. Server sends a final **text frame**: `{"status": "done"}` or `{"status": "error", "detail": "..."}`.
 4. Connection closes. Client reassembles chunks and knows the sample rate is 24 000 Hz.
@@ -280,10 +309,21 @@ Key settings in `xtts_server/config.py` → `Settings(BaseSettings)`:
 | `LOG_LEVEL` | `str` | `"INFO"` | Passed to logging |
 | `CUDA_VISIBLE_DEVICES` | `str` | all GPUs | GPU indices to expose (e.g. `"0,1"`); standard PyTorch env var |
 | `GPU_MEMORY_FRACTION` | `float` | `"1.0"` | Per-worker VRAM cap `(0.0, 1.0]`; exported by `start-server.sh`, read by `worker.py` |
+| `USE_FP16` | `bool` | `False` | Enable mixed-precision inference on GPU via `torch.autocast`. No-op on CPU. See decision #17. |
 
 Required model files in `MODEL_PATH`: `config.json`, `model.pth`, `vocab.json`.
 
 Supported languages (17): `en es fr de it pt pl tr ru nl cs ar zh-cn ja hu ko hi`
+
+---
+
+## Router Layout
+
+`routers/tts.py` exports **two** `APIRouter` instances:
+- `router` (prefix `/v1/tts`) — async fire-and-poll job submission and audio download
+- `audio_router` (prefix `/audio`) — synchronous endpoints: `/audio/speech-file` (raw WAV bytes) and `/audio/speech` (JSON `TtsResponse`)
+
+Both are registered in `main.py`. The sync endpoints share `_run_synthesis()` to avoid duplication. Use `response_class=Response` on binary endpoints so Swagger shows a download link instead of trying to render bytes as JSON.
 
 ---
 
