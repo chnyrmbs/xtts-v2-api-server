@@ -157,8 +157,8 @@ finally:
 ```
 This guarantees the slot is freed even if the client disconnects mid-stream or an unexpected error occurs.
 
-### 10. Least-loaded dispatch
-`dispatcher._pick_worker()` returns `min(workers, key=lambda w: w.active_requests)`. The `active_requests` counter is incremented in `dispatch()` and decremented in `release()`, both under the `asyncio.Condition` lock.
+### 10. GPU-aware least-loaded dispatch
+`dispatcher._pick_worker()` sorts on a two-key tuple: `(total active requests on this GPU, worker's own active_requests)`. This means a new job is routed to an idle GPU before stacking onto a GPU that already has work running, even if that GPU has a free worker slot. Within the same GPU-load tier, the worker with fewer individual active requests wins. The `active_requests` counter is incremented in `dispatch()` and decremented in `release()`, both under the `asyncio.Condition` lock.
 
 ### 11. Per-worker active job tracking
 `WorkerHandle.active_jobs: dict[str, float]` maps job_id → monotonic start time. Populated in `dispatch()`, evicted in `release(job_id=...)`. All three `release()` callers (queue_manager, ws/stream, compute_latents) pass `job_id`. This drives the periodic status log (shows each job and its elapsed time per worker) and the `/v1/system/info` response (`worker_stats()` includes `active_jobs`).

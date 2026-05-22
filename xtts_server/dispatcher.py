@@ -352,8 +352,17 @@ class Dispatcher:
     # ------------------------------------------------------------------
 
     def _pick_worker(self) -> WorkerHandle:
-        """Return worker with the lowest active_requests. Call while holding _cond."""
-        return min(self._workers, key=lambda w: w.active_requests)
+        """Return the least-loaded worker, preferring workers on less-loaded GPUs.
+
+        Sort key: (total active requests across all workers on this GPU, worker's own active_requests).
+        This ensures a new job goes to an idle GPU before stacking onto a GPU that
+        already has work in progress, even if that GPU has a free worker slot.
+        Call while holding _cond.
+        """
+        gpu_load: dict[int, int] = {}
+        for w in self._workers:
+            gpu_load[w.gpu_index] = gpu_load.get(w.gpu_index, 0) + w.active_requests
+        return min(self._workers, key=lambda w: (gpu_load[w.gpu_index], w.active_requests))
 
     async def _periodic_status(self) -> None:
         while True:
