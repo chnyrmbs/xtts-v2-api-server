@@ -46,9 +46,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.11 the default python/pip.
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
- && update-alternatives --install /usr/bin/pip    pip    /usr/bin/pip3      1
+# Make python3.11 the default python.
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
 
 WORKDIR /build
 
