@@ -35,77 +35,53 @@
 # ---- Stage 1: dependency installation ---------------------------------
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS deps
 
-# System packages needed at runtime:
-#   ffmpeg  — required by pydub for MP3 encoding/decoding
-#   libsndfile1 — required by soundfile (WAV/FLAC/OGG)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
     python3.11-venv \
-    python3-pip \
     ffmpeg \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.11 the default python.
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1
-
 WORKDIR /build
 
-# Copy only the dependency manifests first so Docker caches this layer
-# independently of application code changes.
-COPY requirements.in .
+# Use the repository's pinned dependency lock file.
+COPY requirements.txt .
 
-# Install pip-tools, compile the lockfile, then install from it.
-# pip-compile regenerates requirements.txt inside the container so the
-# pins are always resolved fresh against the current PyPI index.
-RUN python3.11 -m ensurepip --upgrade \
- && python3.11 -m pip install --no-cache-dir pip-tools \
- && python3.11 -m piptools compile requirements.in -o requirements.txt --no-header \
- && python3.11 -m pip install --no-cache-dir -r requirements.txt
+# Keep all Python 3.11 packages inside an isolated virtual environment.
+RUN python3.11 -m venv /opt/venv \
+ && /opt/venv/bin/python -m pip install --upgrade pip setuptools wheel \
+ && /opt/venv/bin/python -m pip install --no-cache-dir -r requirements.txt
 
 
 # ---- Stage 2: runtime image -------------------------------------------
 FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04 AS runtime
 
-# Repeat system packages — we don't copy /usr from the deps stage.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.11 \
-    python3-pip \
     ffmpeg \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
- && update-alternatives --install /usr/bin/pip    pip    /usr/bin/pip3      1
+# Copy the complete Python 3.11 virtual environment from build stage.
+COPY --from=deps /opt/venv /opt/venv
 
-# Copy installed Python packages from the deps stage.
-COPY --from=deps /usr/local/lib/python3.11 /usr/local/lib/python3.11
-COPY --from=deps /usr/local/bin            /usr/local/bin
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-# Copy application source.
 COPY xtts_server/ .
 
-# Create directories that the server writes to at runtime.
-# These should normally be mounted as volumes so data persists across
-# container restarts, but having them here avoids startup errors.
-RUN mkdir -p speakers outputs logs
-
-# Non-root user for security — XTTS-v2 doesn't require root.
-RUN useradd -m -u 1000 xtts \
+RUN mkdir -p speakers outputs logs \
+ && useradd -m -u 1000 xtts \
  && chown -R xtts:xtts /app
+
 USER xtts
 
-# Expose the default API port.
 EXPOSE 8000
 
-# Health check — hits the lightweight /health endpoint.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
 
-# MODEL_PATH has no default — the container will exit at startup with a
-# clear error message if this is not set.
 ENV MODEL_PATH=""
 
 CMD ["python", "main.py"]
