@@ -54,7 +54,7 @@ WORKDIR /build
 
 # Copy only the dependency manifests first so Docker caches this layer
 # independently of application code changes.
-COPY xtts_server/requirements.in .
+COPY requirements.in .
 
 # Install pip-tools, compile the lockfile, then install from it.
 # pip-compile regenerates requirements.txt inside the container so the
