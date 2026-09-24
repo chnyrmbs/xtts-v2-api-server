@@ -58,9 +58,10 @@ COPY requirements.in .
 # Install pip-tools, compile the lockfile, then install from it.
 # pip-compile regenerates requirements.txt inside the container so the
 # pins are always resolved fresh against the current PyPI index.
-RUN pip install --no-cache-dir pip-tools \
- && pip-compile requirements.in -o requirements.txt --no-header \
- && pip install --no-cache-dir -r requirements.txt
+RUN python3.11 -m ensurepip --upgrade \
+ && python3.11 -m pip install --no-cache-dir pip-tools \
+ && python3.11 -m piptools compile requirements.in -o requirements.txt --no-header \
+ && python3.11 -m pip install --no-cache-dir -r requirements.txt
 
 
 # ---- Stage 2: runtime image -------------------------------------------
